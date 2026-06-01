@@ -4,7 +4,7 @@ import logging
 import threading
 import queue
 
-# Konfiguracja loggera
+# Konfiguracja profesjonalnego loggera
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
 )
@@ -24,11 +24,13 @@ class MQTTBroker:
     FMT_PUBLISH = "!BHf"  # sensor_id (B), packet_id (H), temp (f)
     FMT_PUBACK = "!BBH"  # type (B), remaining_length (B), packet_id (H)
 
-    PUBLISH_PAYLOAD_SIZE = struct.calcsize(FMT_PUBLISH)
+    PUBLISH_PAYLOAD_SIZE = struct.calcsize(FMT_PUBLISH)  # 7 bajtów
 
     def __init__(self, host: str = "127.0.0.1", port: int = 1883):
         self.host = host
         self.port = port
+        # Każdy subskrybent to krotka (kolejka, filtr).
+        # filtr == 0 oznacza wildcard (wszystkie czujniki).
         self._subscribers: list[tuple[queue.Queue, int]] = []
         self._sub_lock = threading.Lock()
 
@@ -64,10 +66,15 @@ class MQTTBroker:
     def _forward_to_subscribers(
         self, frame: bytes, packet_id: int, sensor_id: int
     ) -> None:
+        """Wrzuca ramkę PUBLISH do kolejki subskrybentów pasujących do sensor_id."""
         with self._sub_lock:
+            # Budujemy listę celów wewnątrz locka, żeby lista była spójna,
+            # ale samo q.put() robimy już poza nim.
             targets = [q for q, f in self._subscribers if f == 0 or f == sensor_id]
+
         for q in targets:
             q.put(frame)
+
         if targets:
             logger.info(
                 f"[FORWARD] PUBLISH | Pakiet: {packet_id} → {len(targets)} subskrybent(ów)"
@@ -97,9 +104,8 @@ class MQTTBroker:
                 msg_type, remaining_length = struct.unpack(self.FMT_HEADER, header)
 
                 if msg_type == self.MSG_SUBSCRIBE:
-                    self._handle_as_subscriber(conn, addr)
+                    self._handle_as_subscriber(conn, addr, remaining_length)
                 elif msg_type == self.MSG_PUBLISH:
-                    # Nagłówek pierwszego PUBLISH już odczytany — przekazujemy remaining_length
                     self._handle_as_sensor(conn, addr, remaining_length)
                 else:
                     logger.error(
@@ -132,7 +138,7 @@ class MQTTBroker:
                 )
                 logger.info(f"[{addr}] [SEND] PUBACK → Pakiet: {packet_id}")
 
-                # Przekazanie do subskrybentów
+                # Przekazanie do pasujących subskrybentów
                 fwd = struct.pack(
                     "!BBBHf",
                     self.MSG_PUBLISH,
@@ -141,7 +147,7 @@ class MQTTBroker:
                     packet_id,
                     temp,
                 )
-                self._forward_to_subscribers(fwd, packet_id, sensor_id)  # +sensor_id
+                self._forward_to_subscribers(fwd, packet_id, sensor_id)
 
                 # Odczyt nagłówka następnego pakietu
                 header = self._recv_exact(conn, 2)
@@ -159,17 +165,24 @@ class MQTTBroker:
 
     # ── Obsługa subskrybenta ──────────────────────────────────────────────────
 
-    def _handle_as_subscriber(self, conn: socket.socket, addr: tuple) -> None:
-        # Odczyt 1-bajtowego payload (remaining_length=1)
-        payload = self._recv_exact(conn, 1)
+    def _handle_as_subscriber(
+        self, conn: socket.socket, addr: tuple, remaining_length: int
+    ) -> None:
+        """Rejestruje subskrybenta z filtrem, uruchamia wątek nadawczy i odbiera PUBACKi."""
+        payload = self._recv_exact(conn, remaining_length)
         (sensor_filter,) = struct.unpack("!B", payload)
 
-        desc = "wszystkie" if sensor_filter == 0 else f"czujnik {sensor_filter}"
+        desc = (
+            "wszystkie czujniki" if sensor_filter == 0 else f"czujnik {sensor_filter}"
+        )
         logger.info(f"[{addr}] Rola: SUBSKRYBENT | Filtr: {desc}")
 
         q: queue.Queue = queue.Queue()
+
+        # Rejestracja przed SUBACK — żeby nie stracić wiadomości opublikowanych
+        # w oknie między wysłaniem SUBACK a faktycznym dodaniem do listy
         with self._sub_lock:
-            self._subscribers.append((q, sensor_filter))  # <-- krotka
+            self._subscribers.append((q, sensor_filter))
 
         conn.sendall(struct.pack(self.FMT_HEADER, self.MSG_SUBACK, 0))
 
@@ -178,9 +191,10 @@ class MQTTBroker:
         )
         sender.start()
 
+        puback_size = struct.calcsize(self.FMT_PUBACK)
         try:
             while True:
-                data = self._recv_exact(conn, struct.calcsize(self.FMT_PUBACK))
+                data = self._recv_exact(conn, puback_size)
                 msg_type, _, packet_id = struct.unpack(self.FMT_PUBACK, data)
                 if msg_type == self.MSG_PUBACK:
                     logger.info(
@@ -189,7 +203,7 @@ class MQTTBroker:
         except ConnectionError:
             logger.warning(f"[{addr}] Subskrybent rozłączył się.")
         finally:
-            q.put(None)
+            q.put(None)  # „Trucizna" — zatrzymuje wątek nadawczy
             with self._sub_lock:
                 self._subscribers.remove((q, sensor_filter))
 

@@ -111,7 +111,7 @@ class MQTTSensor:
                     self.logger.info(
                         f"[RECV] PUBACK  | Pakiet {packet_id} dostarczony."
                     )
-                    return True  # Sukces
+                    return True
 
             except ConnectionError:
                 self.logger.warning("Broker zamknął połączenie.")
